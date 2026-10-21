@@ -519,6 +519,11 @@ def process_quanted_weights_after_loading(model, reload_state):
     # Last: the rebuild reads ``wo_a``, which is only back in its inference
     # layout once the staged FP8 params above have been reinstated.
     refresh_rocm_attention_weight_caches(model)
+    # Ascend MLA decode absorbs queries through matrices precomputed from
+    # kv_b_proj (W_UK_T/W_UV, plus the MLAPO fused preprocess weights); the
+    # refit stream only carries kv_b_proj.weight itself, so rebuild the
+    # derived caches from the freshly loaded weights.
+    refresh_mla_weight_caches(model)
 
 def refresh_kda_packed_conv_weights(model):
     """Repack Kimi KDA in-kernel conv weights after an RL refit.
@@ -565,6 +570,45 @@ def refresh_kda_packed_conv_weights(model):
             packed_before if packed_before is not None else float("nan"),
             packed_after if packed_after is not None else float("nan"),
         )
+
+
+def refresh_mla_weight_caches(model):
+    """Rebuild Ascend MLA decode-side weight caches after an RL refit.
+
+    AscendMLAImpl precomputes the absorbed query/value projection matrices
+    (``W_UK_T``/``W_UV``, plus the MLAPO fused preprocess weights) inside
+    ``process_weights_after_loading`` at engine build time.  With
+    ``load_format='dummy'`` they are built from random init values, and the
+    RL refit stream only carries the raw ``kv_b_proj.weight``: the impl is a
+    plain object hanging off the attention module (not an nn.Module), so the
+    generic post-load hooks never reach it.  Decode attention then absorbs
+    queries with stale matrices while prefill (which reads ``kv_b_proj``
+    directly) stays correct, silently skewing every generated token.  Re-run
+    the impl's own post-load hook once all buckets have landed; existing
+    buffers are refreshed via ``copy_``, so captured-graph addresses stay
+    valid.
+    """
+    try:
+        from vllm_ascend.attention.mla_v1 import AscendMLAImpl
+    except ImportError:
+        AscendMLAImpl = None
+    count = 0
+    for module in model.modules():
+        impl = getattr(module, "impl", None)
+        if impl is None:
+            continue
+        if AscendMLAImpl is not None:
+            if not isinstance(impl, AscendMLAImpl):
+                continue
+        elif not hasattr(impl, "W_UK_T"):
+            continue
+        try:
+            impl.process_weights_after_loading(impl.dtype)
+            count += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("MLA weight cache refresh failed: %r", exc)
+    if count:
+        logger.info("MLA weight caches refreshed, n=%d", count)
 
 
 
