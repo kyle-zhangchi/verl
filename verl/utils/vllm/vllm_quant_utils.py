@@ -513,9 +513,59 @@ def process_quanted_weights_after_loading(model, reload_state):
     reload_state = reload_state or {}
     process_fp8_weights_after_loading(reload_state.get("fp8_layers") or [])
     process_mxfp4_moe_weights_after_loading(reload_state.get("mxfp4_moe_modules") or [])
+    # Kimi KDA in-kernel conv weights live in a packed buffer the refit stream
+    # does not carry; rebuild it from the freshly loaded source conv weights.
+    refresh_kda_packed_conv_weights(model)
     # Last: the rebuild reads ``wo_a``, which is only back in its inference
     # layout once the staged FP8 params above have been reinstated.
     refresh_rocm_attention_weight_caches(model)
+
+def refresh_kda_packed_conv_weights(model):
+    """Repack Kimi KDA in-kernel conv weights after an RL refit.
+
+    Ascend Kimi KDA consumes a kernel-format packed copy of the q/k/v conv
+    weights (``packed_conv_weights`` registered on ``q_conv1d``).  The RL
+    refit stream only carries the source ``*_conv1d.weight`` tensors, and
+    the quantized-model post-load path never invokes the wrapped
+    ``process_weights_after_loading`` hook that performs the repack, so the
+    in-kernel convolution keeps dummy-init values and the KDA recurrence
+    outputs near-zero garbage.  Repack explicitly once all buckets landed.
+    """
+    packed_before = None
+    packed_after = None
+    count = 0
+    for module in model.modules():
+        pack = getattr(module, "_pack_conv_weights", None)
+        if not callable(pack):
+            continue
+        try:
+            if packed_before is None:
+                packed_before = float(
+                    module.q_conv1d.get_parameter("packed_conv_weights")
+                    .float()
+                    .abs()
+                    .mean()
+                )
+            pack()
+            count += 1
+            if packed_after is None:
+                packed_after = float(
+                    module.q_conv1d.get_parameter("packed_conv_weights")
+                    .float()
+                    .abs()
+                    .mean()
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("KDA packed conv refresh failed: %r", exc)
+    if count:
+        logger.info(
+            "Kimi KDA packed conv weights refreshed for %d modules "
+            "(abs_mean before=%.6e after=%.6e)",
+            count,
+            packed_before if packed_before is not None else float("nan"),
+            packed_after if packed_after is not None else float("nan"),
+        )
+
 
 
 def translate_weight_names_for_vllm(weights, model):
